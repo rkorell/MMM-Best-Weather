@@ -1,0 +1,19 @@
+# Dependencies
+node_modules/
+
+# Generated files
+package-lock.json
+BestWeatherStatistics.csv
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor files
+*.swp
+*.swo
+*~
+
+# Backup files
+*.bak
+*.orig

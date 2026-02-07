@@ -1,0 +1,17 @@
+{
+  "name": "mmm-best-weather",
+  "version": "1.0.0",
+  "description": "A simple MagicMirror module to display current weather in TOP 1 city out of a selection of cities - Data from Open-Meteo.",
+  "main": "MMM-Best-Weather.js",
+  "keywords": [
+    "magicmirror",
+    "weather",
+    "open-meteo"
+  ],
+  "author": "Dr. Ralf Korell, MD",
+  "license": "MIT",
+  "dependencies": {
+    "node-fetch": "^2.6.1",
+    "suncalc": "^1.9.0"
+  }
+}

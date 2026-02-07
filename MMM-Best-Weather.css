@@ -1,0 +1,101 @@
+/* Basic style definitions for the module */
+.MMM-Best-Weather { /* Modulname aktualisiert */
+    font-size: 20px;
+    text-align: right; /* Overall module alignment */
+    line-height: 1.2;
+    display: flex; /* Make wrapper a flex container */
+    flex-direction: column; /* Stack sections vertically */
+    align-items: flex-end; /* Align sections to the right */
+    width: 100%; /* Ensure the module takes full available width */
+}
+
+/* Container for icon, temperature, and city name (replaces old wind-info area) */
+.MMM-Best-Weather .current-weather-wrapper {
+    position: relative; /* Needed for absolute positioning of city-name-info */
+    width: 100%; /* Take full width of parent */
+    padding-bottom: 20px; /* Behält den ursprünglichen Abstand bei */
+}
+
+/* Group for Icon and Temperature */
+.MMM-Best-Weather .weather-details {
+    display: flex; /* Arrange icon and temperature horizontally */
+    align-items: center; /* Vertically align icon and temperature */
+    justify-content: flex-start; /* Align to the left within its space */
+    width: 100%; /* Take full width */
+}
+
+/* Style for the weather icon */
+.MMM-Best-Weather .icon {
+    font-size: 60px; /* Icon size */
+    line-height: 1; /* Adjust line height to reduce vertical space */
+    margin-right: 15px; /* Space between icon and temperature */
+    /* Position relative and adjust top to make it slightly "above" the temperature */
+    position: relative;
+    top: -10px; /* Adjust this value as needed for fine-tuning */
+}
+
+/* Style for the temperature display */
+.MMM-Best-Weather .temperature {
+    font-size: 70px; /* Larger temperature font size, mimicking default module */
+    font-weight: normal; /* Not bold */
+    line-height: 1; /* Adjust line height */
+    /* Color will be set inline by JavaScript */
+}
+
+/* City Name Information (ersetzt die Wind Information) */
+.MMM-Best-Weather .city-name-info { /* NEU: Klasse für Städtenamen */
+    position: absolute; /* Position absolut oben rechts, wie die alte Wind-Info */
+    top: 0;
+    right: 0;
+    font-size: 20px; /* Schriftgröße wie alte Wind-Info */
+    white-space: nowrap; /* Verhindert Zeilenumbruch */
+    /* Die Farbe wird inline durch JavaScript gesetzt */
+}
+
+/* Die folgenden wind-bezogenen Stile wurden entfernt, da sie nicht mehr benötigt werden:
+.MMM-My-Actual-Weather .wind-icon-svg-container { ... }
+.MMM-My-Actual-Weather .wind-icon-svg-container svg { ... }
+.MMM-My-Actual-Weather .wind-info .wind-speed { ... }
+*/
+
+/* TOP1 History Information (ersetzt die Precipitation Information) */
+.MMM-Best-Weather .top1-history-info { /* NEU: Klasse für TOP1 Historie */
+    width: 100%; /* Volle Breite */
+    text-align: right; /* Rechtsbündig, wie alte Precipitation-Info */
+    margin-top: -25px; /* Behält den ursprünglichen Abstand bei */
+}
+
+/* Style für einzelne Historie-Einträge */
+.MMM-Best-Weather .history-entry { /* NEU */
+    font-size: 20px; /* Schriftgröße wie alte Precipitation */
+    line-height: 1.2; /* Konsistente Zeilenhöhe */
+    /* Die Farbe wird inline durch JavaScript gesetzt */
+}
+
+/* Style für den Fall, dass keine Historie-Daten vorhanden sind */
+.MMM-Best-Weather .no-history { /* NEU */
+    font-size: 20px; /* Schriftgröße wie alte Precipitation */
+    line-height: 1.2; /* Konsistente Zeilenhöhe */
+    /* Die Farbe wird inline durch JavaScript gesetzt */
+}
+
+/* Die folgenden precipitation-bezogenen Stile wurden entfernt, da sie nicht mehr benötigt werden:
+.MMM-My-Actual-Weather .precipitation { ... }
+*/
+
+/* Example for customization in your custom.css */
+/* These rules should be placed in your ~/MagicMirror/css/custom.css
+   and will target the module's main wrapper when you add
+   classes: "weather_current_own" in your config.js.
+*/
+/*
+.weather_current_own .wi-fog  {
+    content: url("/css/icons/current/wsymbol_0007_fog.png");
+}
+.weather_current_own .wi-day-sunny  {
+  content: url("/css/icons/current/wsymbol_0001_sunny.png");
+}
+.weather_current_own .wi-night-clear  {
+  content: url("/css/icons/current/wsymbol_0008_clear_sky_night.png");
+}
+*/
