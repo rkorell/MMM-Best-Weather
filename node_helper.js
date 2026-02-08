@@ -3,7 +3,7 @@
  * @author Dr. Ralf Korell (2025)
  * @license MIT
  * @description Node helper for MMM-Best-Weather. Handles fetching weather data from Open-Meteo,
- *              calculating a "best weather" score for multiple cities, determining the TOP1 city,
+ *              calculating an HCI-adapted "best weather" score for multiple cities, determining the TOP1 city,
  *              and dynamically calculating the update interval based on API limits.
  *
  * @changelog
@@ -21,6 +21,9 @@
  *                        - Includes timestamp, city name, weather code, temperature, humidity, cloud cover, precipitation, wind speed, and score.
  *                        - Writes header row only if file is newly created.
  *                        - Implemented error handling for file operations.
+ *   2026-02-08 13:30 UTC: Replaced linear score formula with HCI-adapted scoring
+ *                        (Gaussian thermal comfort, cloud aesthetic, physical precipitation/wind, WC override).
+ *                        Added apparent_temperature to API call. Extended CSV format with sub-scores.
  */
 
 const NodeHelper = require("node_helper");
@@ -40,10 +43,8 @@ module.exports = NodeHelper.create({
         console.log("MMM-Best-Weather: Starting node_helper for MMM-Best-Weather.");
         try {
             const citiesFilePath = this.path + "/cities.json";
-            //console.log("MMM-Best-Weather: Attempting to read cities.json from:", citiesFilePath);
             const citiesData = await fs.readFile(citiesFilePath, "utf8");
             this.cities = JSON.parse(citiesData);
-            //console.log(`MMM-Best-Weather: Successfully loaded ${this.cities.length} cities from cities.json.`);
         } catch (error) {
             console.error("MMM-Best-Weather: Error loading cities.json:", error);
             this.sendSocketNotification("WEATHER_ERROR", `MMM-Best-Weather: Failed to load cities.json: ${error.message}`);
@@ -51,15 +52,12 @@ module.exports = NodeHelper.create({
     },
 
     socketNotificationReceived: function(notification, payload) {
-        //console.log("MMM-Best-Weather: Received notification:", notification);
         if (notification === "FETCH_WEATHER") {
             this.fetchWeatherData(payload);
         }
     },
 
     fetchWeatherData: async function(config) {
-        //console.log("MMM-Best-Weather: fetchWeatherData called.");
-
         if (this.cities.length === 0) {
             console.error("MMM-Best-Weather: No cities loaded. Cannot fetch weather data.");
             this.sendSocketNotification("WEATHER_ERROR", "MMM-Best-Weather: No cities loaded for weather fetch.");
@@ -70,9 +68,8 @@ module.exports = NodeHelper.create({
         const latitudes = this.cities.map(city => city.lat).join(",");
         const longitudes = this.cities.map(city => city.lon).join(",");
 
-        // 2. Construct the Open-Meteo API URL
-        const openMeteoUrl = `https://api.open-meteo.com/v1/forecast?latitude=${latitudes}&longitude=${longitudes}&current=temperature_2m,weathercode,precipitation,cloud_cover,relative_humidity_2m,wind_speed_10m`;
-        //console.log("MMM-Best-Weather: Open-Meteo API URL:", openMeteoUrl);
+        // 2. Construct the Open-Meteo API URL (with apparent_temperature for HCI scoring)
+        const openMeteoUrl = `https://api.open-meteo.com/v1/forecast?latitude=${latitudes}&longitude=${longitudes}&current=temperature_2m,apparent_temperature,weathercode,precipitation,cloud_cover,relative_humidity_2m,wind_speed_10m`;
 
         let openMeteoResponse;
         try {
@@ -82,86 +79,83 @@ module.exports = NodeHelper.create({
                 throw new Error(`Open-Meteo API error: ${response.statusText} - ${errorText}`);
             }
             openMeteoResponse = await response.json();
-            //console.log("MMM-Best-Weather: Open-Meteo API response received.");
-            // console.log("MMM-Best-Weather: Open-Meteo API raw response:", JSON.stringify(openMeteoResponse, null, 2)); // Remains commented out
         } catch (error) {
             console.error("MMM-Best-Weather: Error fetching Open-Meteo data for all cities:", error);
             this.sendSocketNotification("WEATHER_ERROR", `MMM-Best-Weather: Open-Meteo multi-city fetch error: ${error.message}`);
             return;
         }
 
-        // 3. Score calculation and determination of the TOP1 city
+        // 3. HCI-adapted score calculation and determination of the TOP1 city
         let bestScore = -Infinity;
         let top1CityData = null;
 
-        // The Open-Meteo response is an array of objects, one for each city.
-        // We need to iterate through this array.
         if (Array.isArray(openMeteoResponse) && openMeteoResponse.length === this.cities.length) {
             const numCities = this.cities.length;
 
-            // Configuration parameters for score calculation with default values
-            const weathercodeImpact = config.weathercodeImpact !== undefined ? config.weathercodeImpact : 1;
-            const humidityImpact = config.humidityImpact !== undefined ? config.humidityImpact : 0.05;
-            const cloudImpact = config.cloudImpact !== undefined ? config.cloudImpact : 0.05;
-            const precipitationImpact = config.precipitationImpact !== undefined ? config.precipitationImpact : 0.1;
-            const windImpact = config.windImpact !== undefined ? config.windImpact : 0.05;
-
-            //console.log(`MMM-Best-Weather: Score impacts - Weathercode: ${weathercodeImpact}, Humidity: ${humidityImpact}, Cloud: ${cloudImpact}, Precipitation: ${precipitationImpact}, Wind: ${windImpact}`);
+            // HCI configuration parameters with defaults
+            const tOpt = config.tOpt !== undefined ? config.tOpt : 22;
+            const sigma = config.sigma !== undefined ? config.sigma : 10;
+            const wcOverrides = config.wcOverrides || {};
 
             for (let i = 0; i < numCities; i++) {
                 const city = this.cities[i];
-                const cityWeatherResponse = openMeteoResponse[i]; // The weather object for the current city
+                const cityWeatherResponse = openMeteoResponse[i];
 
                 // Check if the weather response for this city is valid
-                if (!cityWeatherResponse || !cityWeatherResponse.current || !cityWeatherResponse.current.temperature_2m) {
-                    console.warn(`MMM-Best-Weather: Missing 'current' or 'temperature_2m' data for city index ${i} (${city.city}). Skipping this city.`);
-                    continue; // Skip this city if its data is malformed
+                if (!cityWeatherResponse || !cityWeatherResponse.current || cityWeatherResponse.current.temperature_2m === undefined) {
+                    console.warn(`MMM-Best-Weather: Missing 'current' data for city index ${i} (${city.city}). Skipping.`);
+                    continue;
                 }
 
-                // Extract weather data for the current city from the Open-Meteo response
+                // Extract weather data
                 const temp = cityWeatherResponse.current.temperature_2m;
+                const apparentTemp = cityWeatherResponse.current.apparent_temperature;
                 const weatherCode = cityWeatherResponse.current.weathercode;
                 const precipitation = cityWeatherResponse.current.precipitation;
                 const cloudCover = cityWeatherResponse.current.cloud_cover;
                 const humidity = cityWeatherResponse.current.relative_humidity_2m;
                 const windSpeed = cityWeatherResponse.current.wind_speed_10m;
 
-                // Calculate weather bonus
-                let weatherBonus = 0;
-                if (weathercodeImpact !== 0) {
-                    if (weatherCode === 0) { // Clear sky
-                        weatherBonus = 1;
-                    } else if (weatherCode >= 1 && weatherCode <= 3) { // Mainly clear, partly cloudy, overcast
-                        weatherBonus = 0;
-                    } else if ((weatherCode >= 45 && weatherCode <= 48) || (weatherCode >= 51 && weatherCode <= 61) || (weatherCode >= 63 && weatherCode <= 67)) { // Fog, Drizzle, Rain
-                        weatherBonus = -1;
-                    } else if (weatherCode >= 80 && weatherCode <= 82) { // Rain showers
-                        weatherBonus = -2;
-                    }
-                    if (weathercodeImpact === 2) {
-                        weatherBonus *= 2;
-                    }
+                // --- Thermal Comfort (40%) — Gaussian bell curve around T_opt ---
+                const TC = 10 * Math.exp(-0.5 * Math.pow((apparentTemp - tOpt) / sigma, 2));
+
+                // --- Aesthetic (20%) — Cloud cover rating (research: 10-20% optimal) ---
+                let A;
+                if (cloudCover <= 20) {
+                    A = 9 + cloudCover / 20;
+                } else if (cloudCover <= 50) {
+                    A = 10 - (cloudCover - 20) * 0.1;
+                } else {
+                    A = 7 - (cloudCover - 50) * 0.1;
                 }
 
-                // Calculate score
-                const score = temp + weatherBonus -
-                              (humidityImpact * humidity) -
-                              (cloudImpact * cloudCover) -
-                              (precipitationImpact * precipitation) -
-                              (windImpact * windSpeed);
+                // --- Physical (40%) — Precipitation + Wind, worse value dominates ---
+                const pRain = Math.max(0, Math.min(10, 10 - precipitation * 3));
+                const pWind = Math.max(0, Math.min(10, 10 - windSpeed * 0.2));
+                const P = Math.min(pRain, pWind);
 
-                // console.log(`MMM-Best-Weather: City: ${city.city}, Temp: ${temp}, WC: ${weatherCode}, Precip: ${precipitation}, Cloud: ${cloudCover}, Humidity: ${humidity}, Wind: ${windSpeed}, WB: ${weatherBonus}, Score: ${score}`);
+                // --- Weather Code Override (multiplier) ---
+                const wcOverride = this.getWeatherCodeOverride(weatherCode, wcOverrides);
+
+                // --- HCI Score (0-100) ---
+                const score = (0.4 * TC + 0.2 * A + 0.4 * P) * 10 * wcOverride;
 
                 if (score > bestScore) {
                     bestScore = score;
                     top1CityData = {
                         name: city.city,
                         temperature: temp,
+                        apparentTemperature: apparentTemp,
                         weatherCode: weatherCode,
                         latitude: city.lat,
                         longitude: city.lon,
                         score: score,
-                        // Additional fields for statistics file, as discussed
+                        // Sub-scores for statistics
+                        tc: TC,
+                        aesthetic: A,
+                        physical: P,
+                        wcOverride: wcOverride,
+                        // Raw data for statistics
                         humidity: humidity,
                         cloudCover: cloudCover,
                         precipitation: precipitation,
@@ -169,11 +163,9 @@ module.exports = NodeHelper.create({
                     };
                 }
             }
-            //console.log(`MMM-Best-Weather: TOP1 city determined: ${top1CityData ? top1CityData.name : 'None'}, Score: ${bestScore}`);
         } else {
-            // More precise error message
-            console.error("MMM-Best-Weather: Open-Meteo response is not an array or length mismatch with cities.json, or missing 'current' data for some cities.");
-            this.sendSocketNotification("WEATHER_ERROR", "MMM-Best-Weather: Open-Meteo: Invalid response structure or missing data.");
+            console.error("MMM-Best-Weather: Open-Meteo response is not an array or length mismatch with cities.json.");
+            this.sendSocketNotification("WEATHER_ERROR", "MMM-Best-Weather: Open-Meteo: Invalid response structure.");
             return;
         }
 
@@ -183,77 +175,60 @@ module.exports = NodeHelper.create({
             const now = new Date();
             const times = SunCalc.getTimes(now, top1CityData.latitude, top1CityData.longitude);
             isDayForTop1 = now > times.sunrise && now < times.sunset;
-           // console.log(`MMM-Best-Weather: Day/Night for TOP1 city (${top1CityData.name}): isDay = ${isDayForTop1}`);
         } else {
-            console.warn("MMM-Best-Weather: Could not determine day/night for TOP1 city (missing lat/lon). Defaulting to day.");
+            console.warn("MMM-Best-Weather: Could not determine day/night for TOP1 city. Defaulting to day.");
         }
 
         // 5. Calculate dynamic update interval
-        const openmeteoMaxQueriesPerDay = config.openmeteoMaxQueriesPerDay || 5000; // Default to 5000 if not set
+        const openmeteoMaxQueriesPerDay = config.openmeteoMaxQueriesPerDay || 5000;
         const numCitiesToQuery = this.cities.length;
 
         let calculatedUpdateIntervalMs;
-        let resultingUpdatesPerDay = 0; // Initialize for logging
-        let resultingNumberOfQueriesPerDay = 0; // Initialize for logging
+        let resultingUpdatesPerDay = 0;
+        let resultingNumberOfQueriesPerDay = 0;
 
         if (numCitiesToQuery > 0) {
-            // Calculate how many updates per day are allowed for this module
             let updatesPerDayCandidate = Math.floor(openmeteoMaxQueriesPerDay / numCitiesToQuery);
-
-            // Round down updatesPerDay to the nearest multiple of 10 for a more conservative buffer
             updatesPerDayCandidate = Math.floor(updatesPerDayCandidate / 10) * 10;
-
-            // Ensure updatesPerDay is at least 1 after rounding, to avoid division by zero
             if (updatesPerDayCandidate === 0) {
                 updatesPerDayCandidate = 1;
             }
-            resultingUpdatesPerDay = updatesPerDayCandidate; // Store for logging
+            resultingUpdatesPerDay = updatesPerDayCandidate;
 
-            // Calculate interval in minutes, then convert to milliseconds
             const totalMinutesInDay = 24 * 60;
             const intervalInMinutes = totalMinutesInDay / resultingUpdatesPerDay;
             calculatedUpdateIntervalMs = intervalInMinutes * 60 * 1000;
 
-            resultingNumberOfQueriesPerDay = resultingUpdatesPerDay * numCitiesToQuery; // Store for logging
-
+            resultingNumberOfQueriesPerDay = resultingUpdatesPerDay * numCitiesToQuery;
         } else {
-            // No cities to query, use MAX_UPDATE_INTERVAL to prevent frequent checks
-            console.warn("MMM-Best-Weather: No cities configured. Using MAX_UPDATE_INTERVAL for update scheduling.");
+            console.warn("MMM-Best-Weather: No cities configured. Using MAX_UPDATE_INTERVAL.");
             calculatedUpdateIntervalMs = MAX_UPDATE_INTERVAL;
-            // For logging, set these to 0 as no queries are being made
             resultingUpdatesPerDay = 0;
             resultingNumberOfQueriesPerDay = 0;
         }
 
-        // Apply min/max bounds to the calculated interval
         calculatedUpdateIntervalMs = Math.max(MIN_UPDATE_INTERVAL, calculatedUpdateIntervalMs);
         calculatedUpdateIntervalMs = Math.min(MAX_UPDATE_INTERVAL, calculatedUpdateIntervalMs);
 
-       // console.log(`MMM-Best-Weather: API Stats: Max Queries: ${openmeteoMaxQueriesPerDay}, City Count: ${numCitiesToQuery} - Update Interval: ${calculatedUpdateIntervalMs / (60 * 1000)} minutes, Resulting Queries: ${resultingNumberOfQueriesPerDay}`);
-
-        // NEW: 6. Write statistics to file if configured
+        // 6. Write statistics to file if configured
         if (config.statisticsFileName && top1CityData) {
             const statsFilePath = this.path + "/" + config.statisticsFileName;
             const now = new Date();
-            // Format timestamp as DD.MM.YYYY HH:MM
             const timestamp = `${now.getDate().toString().padStart(2, '0')}.${(now.getMonth() + 1).toString().padStart(2, '0')}.${now.getFullYear()} ${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')}`;
-            
-            // Construct CSV line with semicolon delimiter
-            const csvLine = `${timestamp};${top1CityData.name};${top1CityData.weatherCode};${top1CityData.temperature};${top1CityData.humidity};${top1CityData.cloudCover};${top1CityData.precipitation};${top1CityData.windSpeed};${top1CityData.score.toFixed(3)}\n`;
+
+            // Extended CSV line with sub-scores
+            const csvLine = `${timestamp};${top1CityData.name};${top1CityData.weatherCode};${top1CityData.temperature};${top1CityData.apparentTemperature};${top1CityData.humidity};${top1CityData.cloudCover};${top1CityData.precipitation};${top1CityData.windSpeed};${top1CityData.tc.toFixed(2)};${top1CityData.aesthetic.toFixed(2)};${top1CityData.physical.toFixed(2)};${top1CityData.wcOverride.toFixed(2)};${top1CityData.score.toFixed(1)}\n`;
 
             try {
-                // Check if file exists to write header (fs.constants.F_OK checks for file existence)
                 const fileExists = await fs.access(statsFilePath, fs.constants.F_OK)
                     .then(() => true)
-                    .catch(() => false); // If access fails, file does not exist
+                    .catch(() => false);
 
                 if (!fileExists) {
-                    const header = "Timestamp;City;WeatherCode;Temperature;Humidity;CloudCover;Precipitation;WindSpeed;Score\n";
+                    const header = "Timestamp;City;WeatherCode;Temperature;ApparentTemperature;Humidity;CloudCover;Precipitation;WindSpeed;TC;A;P;WC_Override;Score\n";
                     await fs.writeFile(statsFilePath, header, { encoding: 'utf8' });
-                   // console.log(`MMM-Best-Weather: Created new statistics file with header: ${statsFilePath}`);
                 }
                 await fs.appendFile(statsFilePath, csvLine, { encoding: 'utf8' });
-               // console.log(`MMM-Best-Weather: Appended statistics for ${top1CityData.name} to ${statsFilePath}`);
             } catch (error) {
                 console.error(`MMM-Best-Weather: Error writing statistics to file ${statsFilePath}:`, error);
             }
@@ -264,19 +239,27 @@ module.exports = NodeHelper.create({
             const weatherData = {
                 cityName: top1CityData.name,
                 temperature: top1CityData.temperature,
+                apparentTemperature: top1CityData.apparentTemperature,
                 weatherCode: top1CityData.weatherCode,
+                score: top1CityData.score,
                 isDay: isDayForTop1,
                 weatherIconClass: this.getWeatherIcon(top1CityData.weatherCode, isDayForTop1),
-                calculatedUpdateIntervalMs: calculatedUpdateIntervalMs // Send calculated interval
+                calculatedUpdateIntervalMs: calculatedUpdateIntervalMs
             };
-           // console.log("MMM-Best-Weather: Sending WEATHER_DATA notification with:", weatherData);
             this.sendSocketNotification("WEATHER_DATA", weatherData);
         } else {
             console.error("MMM-Best-Weather: Could not determine TOP1 city, no data to send.");
             this.sendSocketNotification("WEATHER_ERROR", "MMM-Best-Weather: Could not determine TOP1 city.");
-            // Even if no TOP1 city, still send calculated interval for next attempt
             this.sendSocketNotification("WEATHER_DATA", { calculatedUpdateIntervalMs: calculatedUpdateIntervalMs });
         }
+    },
+
+    getWeatherCodeOverride: function(weatherCode, overrides) {
+        if (overrides && overrides[weatherCode] !== undefined) {
+            return overrides[weatherCode];
+        }
+        // Default for unknown weather codes
+        return 0.5;
     },
 
     getWeatherIcon: function(weatherCode, isDay) {

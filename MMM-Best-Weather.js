@@ -11,6 +11,8 @@
  *   2025-09-28 15:05 UTC: Implemented dynamic update interval calculation based on API limits.
  *                        Added 'openmeteoMaxQueriesPerDay' and 'statisticsFileName' config parameters.
  *                        Translated all comments to English.
+ *   2026-02-08 13:30 UTC: Replaced old linear score config params with HCI-adapted parameters
+ *                        (tOpt, sigma, wcOverrides). Added optional score display (showScore).
  */
 
 Module.register("MMM-Best-Weather", {
@@ -58,19 +60,30 @@ Module.register("MMM-Best-Weather", {
         lang: config.language, // Language from MagicMirror configuration
         decimalPlacesTemp: 1, // Number of decimal places for temperature
 
-        // New config parameters for score calculation and history
-        weathercodeImpact: 1, // integer, 0, 1 (default) or 2
-        humidityImpact: 0.05, // float
-        cloudImpact: 0.05, // float
-        precipitationImpact: 0.1, // float
-        windImpact: 0.05, // float
+        // HCI-adapted score parameters
+        tOpt: 22, // Optimal apparent temperature (°C) for Gaussian thermal comfort curve
+        sigma: 10, // Gaussian width — how quickly comfort drops away from tOpt
+        wcOverrides: { // Weather code override multipliers (0.0 = worst, 1.0 = no penalty)
+            0: 1.0, 1: 1.0, 2: 1.0,       // Clear / mainly clear / partly cloudy
+            3: 0.9,                          // Overcast
+            45: 0.7, 48: 0.7,               // Fog / depositing rime fog
+            51: 0.7, 53: 0.7, 55: 0.7,      // Drizzle (light / moderate / dense)
+            56: 0.5, 57: 0.5,               // Freezing drizzle
+            61: 0.6, 63: 0.4, 65: 0.3,      // Rain (slight / moderate / heavy)
+            66: 0.3, 67: 0.3,               // Freezing rain
+            71: 0.4, 73: 0.4, 75: 0.3, 77: 0.4, // Snow
+            80: 0.5, 81: 0.3, 82: 0.3,      // Rain showers
+            85: 0.4, 86: 0.3,               // Snow showers
+            95: 0.2, 96: 0.1, 99: 0.1       // Thunderstorms
+        },
+        showScore: false, // If true, show HCI score next to city name, e.g. "Freiburg (29)"
         showTop1History: false, // boolean, whether to display the history of TOP1 cities
 
         // New config parameters for dynamic update interval
         openmeteoMaxQueriesPerDay: 5000, // Maximum Open-Meteo queries allowed per day for this module
 
-        // New config parameter for statistics file
-        statisticsFileName: "BestWeatherStatistics.csv", // File name for statistics (future use)
+        // Statistics file (new HCI format, old CSV remains as archive)
+        statisticsFileName: "BestWeatherStatisticsHCI.csv", // File name for statistics
 
         // New color parameters
         cityColor: "white", // Color for the city name
@@ -233,7 +246,9 @@ Module.register("MMM-Best-Weather", {
         cityNameInfo.className = "city-name-info";
         var cityNameSpan = document.createElement("span");
         cityNameSpan.className = "city-name";
-        cityNameSpan.innerHTML = this.weatherData.cityName;
+        cityNameSpan.innerHTML = this.config.showScore && this.weatherData.score !== undefined
+            ? this.weatherData.cityName + " (" + Math.round(this.weatherData.score) + ")"
+            : this.weatherData.cityName;
         cityNameInfo.appendChild(cityNameSpan);
         cityNameInfo.style.color = this.config.cityColor; // Apply color for city name
         currentWeatherWrapper.appendChild(cityNameInfo);

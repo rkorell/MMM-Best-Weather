@@ -4,6 +4,7 @@ node_modules/
 # Generated files
 package-lock.json
 BestWeatherStatistics.csv
+BestWeatherStatisticsHCI.csv
 
 # OS files
 .DS_Store
