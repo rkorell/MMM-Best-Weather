@@ -24,9 +24,12 @@
  *   2026-02-08 13:30 UTC: Replaced linear score formula with HCI-adapted scoring
  *                        (Gaussian thermal comfort, cloud aesthetic, physical precipitation/wind, WC override).
  *                        Added apparent_temperature to API call. Extended CSV format with sub-scores.
+ *   2026-02-19: Added level-based logging (DebugLevel config parameter).
+ *              Replaced all console.log/error/warn with _log() helper using BestWeather prefix.
  */
 
 const NodeHelper = require("node_helper");
+const Log = require("logger");
 const fetch = require("node-fetch"); // For API requests
 const SunCalc = require("suncalc"); // For sunrise/sunset calculations
 const fs = require("fs").promises; // For reading/writing file content
@@ -39,28 +42,54 @@ module.exports = NodeHelper.create({
     // Store the loaded city data
     cities: [],
 
+    // Debug level: default DEBUG until config arrives from frontend
+    debugLevel: "DEBUG",
+
+    // Level-based logging helper
+    _log: function(level, msg) {
+        const levels = { ERROR: 0, WARN: 1, INFO: 2, DEBUG: 3 };
+        const configLevel = levels[this.debugLevel] !== undefined ? levels[this.debugLevel] : 3;
+        if (levels[level] <= configLevel) {
+            const prefix = `BestWeather [${level}]:`;
+            if (level === "ERROR") Log.error(prefix, msg);
+            else if (level === "WARN") Log.warn(prefix, msg);
+            else Log.log(prefix, msg);
+        }
+    },
+
     start: async function() {
-        console.log("MMM-Best-Weather: Starting node_helper for MMM-Best-Weather.");
+        this._log("INFO", `start() called, path=${this.path}`);
         try {
             const citiesFilePath = this.path + "/cities.json";
             const citiesData = await fs.readFile(citiesFilePath, "utf8");
             this.cities = JSON.parse(citiesData);
+            this._log("INFO", `Loaded ${this.cities.length} cities from ${citiesFilePath}`);
         } catch (error) {
-            console.error("MMM-Best-Weather: Error loading cities.json:", error);
-            this.sendSocketNotification("WEATHER_ERROR", `MMM-Best-Weather: Failed to load cities.json: ${error.message}`);
+            this._log("ERROR", `Failed to load cities.json: ${error.message}`);
+            // Do NOT call sendSocketNotification here — no browser client connected yet
         }
     },
 
     socketNotificationReceived: function(notification, payload) {
+        this._log("DEBUG", `Received notification: ${notification}`);
         if (notification === "FETCH_WEATHER") {
+            // Update debug level from config on first (and every subsequent) call
+            if (payload && payload.DebugLevel) {
+                if (this.debugLevel !== payload.DebugLevel) {
+                    this.debugLevel = payload.DebugLevel;
+                    this._log("DEBUG", `DebugLevel set to ${this.debugLevel}`);
+                }
+            }
             this.fetchWeatherData(payload);
         }
     },
 
     fetchWeatherData: async function(config) {
+        this._log("DEBUG", `fetchWeatherData called, ${this.cities.length} cities`);
+
         if (this.cities.length === 0) {
-            console.error("MMM-Best-Weather: No cities loaded. Cannot fetch weather data.");
-            this.sendSocketNotification("WEATHER_ERROR", "MMM-Best-Weather: No cities loaded for weather fetch.");
+            this._log("ERROR", "No cities loaded, cannot fetch weather data");
+            this.sendSocketNotification("WEATHER_ERROR", "BestWeather: No cities loaded for weather fetch.");
             return;
         }
 
@@ -71,6 +100,8 @@ module.exports = NodeHelper.create({
         // 2. Construct the Open-Meteo API URL (with apparent_temperature for HCI scoring)
         const openMeteoUrl = `https://api.open-meteo.com/v1/forecast?latitude=${latitudes}&longitude=${longitudes}&current=temperature_2m,apparent_temperature,weathercode,precipitation,cloud_cover,relative_humidity_2m,wind_speed_10m`;
 
+        this._log("DEBUG", `API URL: ${openMeteoUrl.substring(0, 120)}...`);
+
         let openMeteoResponse;
         try {
             const response = await fetch(openMeteoUrl);
@@ -79,9 +110,10 @@ module.exports = NodeHelper.create({
                 throw new Error(`Open-Meteo API error: ${response.statusText} - ${errorText}`);
             }
             openMeteoResponse = await response.json();
+            this._log("DEBUG", `API response: ${Array.isArray(openMeteoResponse) ? openMeteoResponse.length : 'single'} entries received`);
         } catch (error) {
-            console.error("MMM-Best-Weather: Error fetching Open-Meteo data for all cities:", error);
-            this.sendSocketNotification("WEATHER_ERROR", `MMM-Best-Weather: Open-Meteo multi-city fetch error: ${error.message}`);
+            this._log("ERROR", `API fetch error: ${error.message}`);
+            this.sendSocketNotification("WEATHER_ERROR", `BestWeather: Open-Meteo fetch error: ${error.message}`);
             return;
         }
 
@@ -103,7 +135,7 @@ module.exports = NodeHelper.create({
 
                 // Check if the weather response for this city is valid
                 if (!cityWeatherResponse || !cityWeatherResponse.current || cityWeatherResponse.current.temperature_2m === undefined) {
-                    console.warn(`MMM-Best-Weather: Missing 'current' data for city index ${i} (${city.city}). Skipping.`);
+                    this._log("WARN", `Missing 'current' data for city index ${i} (${city.city}), skipping`);
                     continue;
                 }
 
@@ -164,8 +196,8 @@ module.exports = NodeHelper.create({
                 }
             }
         } else {
-            console.error("MMM-Best-Weather: Open-Meteo response is not an array or length mismatch with cities.json.");
-            this.sendSocketNotification("WEATHER_ERROR", "MMM-Best-Weather: Open-Meteo: Invalid response structure.");
+            this._log("ERROR", `Invalid API response structure: isArray=${Array.isArray(openMeteoResponse)}, length=${Array.isArray(openMeteoResponse) ? openMeteoResponse.length : 'N/A'}, expected=${this.cities.length}`);
+            this.sendSocketNotification("WEATHER_ERROR", "BestWeather: Invalid API response structure.");
             return;
         }
 
@@ -176,7 +208,7 @@ module.exports = NodeHelper.create({
             const times = SunCalc.getTimes(now, top1CityData.latitude, top1CityData.longitude);
             isDayForTop1 = now > times.sunrise && now < times.sunset;
         } else {
-            console.warn("MMM-Best-Weather: Could not determine day/night for TOP1 city. Defaulting to day.");
+            this._log("WARN", "Could not determine day/night for TOP1 city, defaulting to day");
         }
 
         // 5. Calculate dynamic update interval
@@ -201,14 +233,14 @@ module.exports = NodeHelper.create({
 
             resultingNumberOfQueriesPerDay = resultingUpdatesPerDay * numCitiesToQuery;
         } else {
-            console.warn("MMM-Best-Weather: No cities configured. Using MAX_UPDATE_INTERVAL.");
+            this._log("WARN", "No cities configured, using MAX_UPDATE_INTERVAL");
             calculatedUpdateIntervalMs = MAX_UPDATE_INTERVAL;
-            resultingUpdatesPerDay = 0;
-            resultingNumberOfQueriesPerDay = 0;
         }
 
         calculatedUpdateIntervalMs = Math.max(MIN_UPDATE_INTERVAL, calculatedUpdateIntervalMs);
         calculatedUpdateIntervalMs = Math.min(MAX_UPDATE_INTERVAL, calculatedUpdateIntervalMs);
+
+        this._log("INFO", `Update interval: ${(calculatedUpdateIntervalMs / 1000).toFixed(0)}s (${resultingNumberOfQueriesPerDay} queries/day)`);
 
         // 6. Write statistics to file if configured
         if (config.statisticsFileName && top1CityData) {
@@ -229,13 +261,15 @@ module.exports = NodeHelper.create({
                     await fs.writeFile(statsFilePath, header, { encoding: 'utf8' });
                 }
                 await fs.appendFile(statsFilePath, csvLine, { encoding: 'utf8' });
+                this._log("DEBUG", `Stats appended to ${config.statisticsFileName}`);
             } catch (error) {
-                console.error(`MMM-Best-Weather: Error writing statistics to file ${statsFilePath}:`, error);
+                this._log("ERROR", `Error writing statistics to ${statsFilePath}: ${error.message}`);
             }
         }
 
         // 7. Send the TOP1 city data and the calculated update interval to the main module
         if (top1CityData) {
+            this._log("INFO", `TOP1: ${top1CityData.name}, score=${top1CityData.score.toFixed(1)}, temp=${top1CityData.temperature}°C`);
             const weatherData = {
                 cityName: top1CityData.name,
                 temperature: top1CityData.temperature,
@@ -246,10 +280,11 @@ module.exports = NodeHelper.create({
                 weatherIconClass: this.getWeatherIcon(top1CityData.weatherCode, isDayForTop1),
                 calculatedUpdateIntervalMs: calculatedUpdateIntervalMs
             };
+            this._log("DEBUG", "Sending WEATHER_DATA to frontend");
             this.sendSocketNotification("WEATHER_DATA", weatherData);
         } else {
-            console.error("MMM-Best-Weather: Could not determine TOP1 city, no data to send.");
-            this.sendSocketNotification("WEATHER_ERROR", "MMM-Best-Weather: Could not determine TOP1 city.");
+            this._log("ERROR", "Could not determine TOP1 city, no data to send");
+            this.sendSocketNotification("WEATHER_ERROR", "BestWeather: Could not determine TOP1 city.");
             this.sendSocketNotification("WEATHER_DATA", { calculatedUpdateIntervalMs: calculatedUpdateIntervalMs });
         }
     },

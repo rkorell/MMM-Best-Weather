@@ -13,9 +13,23 @@
  *                        Translated all comments to English.
  *   2026-02-08 13:30 UTC: Replaced old linear score config params with HCI-adapted parameters
  *                        (tOpt, sigma, wcOverrides). Added optional score display (showScore).
+ *   2026-02-19: Added level-based logging (DebugLevel config parameter).
+ *              Replaced all Log.log/info/warn/error with _log() helper using BestWeather prefix.
  */
 
 Module.register("MMM-Best-Weather", {
+    // Level-based logging helper (mirrors node_helper._log)
+    _log: function(level, msg) {
+        const levels = { ERROR: 0, WARN: 1, INFO: 2, DEBUG: 3 };
+        const configLevel = levels[this.config.DebugLevel] !== undefined ? levels[this.config.DebugLevel] : 2;
+        if (levels[level] <= configLevel) {
+            const prefix = `BestWeather [${level}]:`;
+            if (level === "ERROR") Log.error(prefix, msg);
+            else if (level === "WARN") Log.warn(prefix, msg);
+            else Log.log(prefix, msg);
+        }
+    },
+
     // Helper to convert any CSS color string (named, hex, rgb()) to RGB object
     // This function leverages the browser's ability to compute styles.
     cssColorToRgb: function(colorString) {
@@ -27,9 +41,7 @@ Module.register("MMM-Best-Weather", {
         const computedColor = window.getComputedStyle(tempDiv).color;
         document.body.removeChild(tempDiv);
 
-        // --- ADDED LOGGING FOR DEBUGGING (from previous step) ---
-        Log.log(`MMM-Best-Weather: Resolving color "${colorString}" -> Computed: "${computedColor}"`);
-        // --- END ADDED LOGGING ---
+        this._log("DEBUG", `Resolving color "${colorString}" -> Computed: "${computedColor}"`);
 
         const match = computedColor.match(/rgb\((\d+),\s*(\d+),\s*(\d+)\)/);
         if (match) {
@@ -49,7 +61,7 @@ Module.register("MMM-Best-Weather", {
                 b: bigint & 255
             };
         }
-        Log.warn(`MMM-Best-Weather: Failed to resolve color "${colorString}" to RGB. Computed: "${computedColor}". Defaulting to white.`);
+        this._log("WARN", `Failed to resolve color "${colorString}" to RGB. Computed: "${computedColor}". Defaulting to white.`);
         return { r: 255, g: 255, b: 255 }; // Default to white if resolution fails
     },
 
@@ -116,9 +128,9 @@ Module.register("MMM-Best-Weather", {
         this.loaded = false; // Flag if data has been loaded
         this.top1History = []; // Initializes the buffer for the TOP1 history
         this.currentUpdateTimer = null; // Stores the timer for updates
+        this._log("INFO", "Module starting, requesting initial data");
         this.getWeatherData(); // Starts the first data fetch
         // scheduleUpdate will be called after first data fetch with calculated interval
-        Log.info("Starting module: " + this.name);
     },
 
     // CSS files to be loaded
@@ -146,14 +158,14 @@ Module.register("MMM-Best-Weather", {
             .map(point => ({ temp: point.temp, colorName: point.color, rgb: this.cssColorToRgb(point.color) }))
             .sort((a, b) => a.temp - b.temp); // Ensure points are sorted by temperature
 
-        Log.log(`MMM-Best-Weather: Calculating color for temp ${temp}°C`);
+        this._log("DEBUG", `Calculating color for temp ${temp}°C`);
 
         if (gradientPoints.length === 0) {
-            Log.warn("MMM-Best-Weather: tempColorGradient is empty. Defaulting to white.");
+            this._log("WARN", "tempColorGradient is empty. Defaulting to white.");
             return "rgb(255, 255, 255)"; // Fallback if no gradient points are defined
         }
         if (gradientPoints.length === 1) {
-            Log.log(`MMM-Best-Weather: Only one gradient point. Using color: rgb(${gradientPoints[0].rgb.r}, ${gradientPoints[0].rgb.g}, ${gradientPoints[0].rgb.b})`);
+            this._log("DEBUG", `Only one gradient point. Using color: rgb(${gradientPoints[0].rgb.r}, ${gradientPoints[0].rgb.g}, ${gradientPoints[0].rgb.b})`);
             return `rgb(${gradientPoints[0].rgb.r}, ${gradientPoints[0].rgb.g}, ${gradientPoints[0].rgb.b})`; // Only one point, use its color
         }
 
@@ -171,17 +183,17 @@ Module.register("MMM-Best-Weather", {
 
         // Handle temperatures outside the defined range
         if (temp < gradientPoints[0].temp) {
-            Log.log(`MMM-Best-Weather: Temp ${temp}°C below lowest point ${gradientPoints[0].temp}°C. Using color of lowest point (${gradientPoints[0].colorName}).`);
+            this._log("DEBUG", `Temp ${temp}°C below lowest point ${gradientPoints[0].temp}°C. Using color of lowest point (${gradientPoints[0].colorName}).`);
             return `rgb(${gradientPoints[0].rgb.r}, ${gradientPoints[0].rgb.g}, ${gradientPoints[0].rgb.b})`;
         }
         if (temp > gradientPoints[gradientPoints.length - 1].temp) {
-            Log.log(`MMM-Best-Weather: Temp ${temp}°C above highest point ${gradientPoints[gradientPoints.length - 1].temp}°C. Using color of highest point (${gradientPoints[gradientPoints.length - 1].colorName}).`);
+            this._log("DEBUG", `Temp ${temp}°C above highest point ${gradientPoints[gradientPoints.length - 1].temp}°C. Using color of highest point (${gradientPoints[gradientPoints.length - 1].colorName}).`);
             return `rgb(${gradientPoints[gradientPoints.length - 1].rgb.r}, ${gradientPoints[gradientPoints.length - 1].rgb.g}, ${gradientPoints[gradientPoints.length - 1].rgb.b})`;
         }
 
         // If for some reason lowerPoint or upperPoint are still null (shouldn't happen with the above checks)
         if (!lowerPoint || !upperPoint) {
-            Log.error(`MMM-Best-Weather: Logic error in getTemperatureColor for temp ${temp}°C. Falling back to white.`);
+            this._log("ERROR", `Logic error in getTemperatureColor for temp ${temp}°C. Falling back to white.`);
             return "rgb(255, 255, 255)";
         }
 
@@ -194,8 +206,7 @@ Module.register("MMM-Best-Weather", {
         const b = Math.round(lowerPoint.rgb.b + factor * (upperPoint.rgb.b - lowerPoint.rgb.b));
 
         const finalColor = `rgb(${r}, ${g}, ${b})`;
-        // Log the colorName property, which now holds the original string
-        Log.log(`MMM-Best-Weather: Temp ${temp}°C, Segment: ${lowerPoint.temp}°C (${lowerPoint.colorName}) to ${upperPoint.temp}°C (${upperPoint.colorName}), Factor: ${factor.toFixed(4)}, Final Color: ${finalColor}`);
+        this._log("DEBUG", `Temp ${temp}°C, Segment: ${lowerPoint.temp}°C (${lowerPoint.colorName}) to ${upperPoint.temp}°C (${upperPoint.colorName}), Factor: ${factor.toFixed(4)}, Final Color: ${finalColor}`);
         return finalColor;
     },
 
@@ -205,16 +216,20 @@ Module.register("MMM-Best-Weather", {
         wrapper.className = "MMM-Best-Weather";
 
         if (!this.loaded) {
+            this._log("DEBUG", "getDom: loading state");
             wrapper.innerHTML = this.translate("LOADING");
             wrapper.className += " dimmed light small";
             return wrapper;
         }
 
         if (!this.weatherData) {
+            this._log("DEBUG", "getDom: no weather data");
             wrapper.innerHTML = this.translate("NO_WEATHER_DATA");
             wrapper.className += " dimmed light small";
             return wrapper;
         }
+
+        this._log("DEBUG", `getDom: rendering ${this.weatherData.cityName}`);
 
         // --- Current Weather Section (mimics default module structure) ---
         var currentWeatherWrapper = document.createElement("div");
@@ -293,11 +308,12 @@ Module.register("MMM-Best-Weather", {
         this.currentUpdateTimer = setTimeout(function() {
             self.getWeatherData();
         }, delay);
-        Log.log(`MMM-Best-Weather: Next update scheduled in ${delay / 1000} seconds.`);
+        this._log("DEBUG", `Next update in ${(delay / 1000).toFixed(0)}s`);
     },
 
     // Requests weather data from the node_helper
     getWeatherData: function() {
+        this._log("DEBUG", "Requesting FETCH_WEATHER from node_helper");
         // Send the full config to the node_helper, including new impact parameters and API limit
         this.sendSocketNotification("FETCH_WEATHER", this.config);
     },
@@ -305,6 +321,7 @@ Module.register("MMM-Best-Weather", {
     // Receives notifications from the node_helper
     socketNotificationReceived: function(notification, payload) {
         if (notification === "WEATHER_DATA") {
+            this._log("INFO", `Data received: ${payload.cityName || "no city"}, ${payload.temperature !== undefined ? payload.temperature + "°C" : "no temp"}`);
             // Update weatherData
             this.weatherData = payload;
 
@@ -326,12 +343,12 @@ Module.register("MMM-Best-Weather", {
             if (payload.calculatedUpdateIntervalMs) {
                 this.scheduleUpdate(payload.calculatedUpdateIntervalMs);
             } else {
-                Log.warn("MMM-Best-Weather: Node_helper did not provide an update interval. Scheduling with default (30 minutes).");
+                this._log("WARN", "Node_helper did not provide an update interval. Scheduling with default (30 minutes).");
                 this.scheduleUpdate(30 * 60 * 1000); // Fallback to 30 minutes
             }
 
         } else if (notification === "WEATHER_ERROR") {
-            Log.error(this.name + ": " + payload);
+            this._log("ERROR", `Error received: ${payload}`);
             this.loaded = true;
             this.weatherData = null; // Set data to null to display error message
             this.updateDom(this.config.animationSpeed);
