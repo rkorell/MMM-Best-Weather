@@ -37,6 +37,7 @@ const fs = require("fs").promises; // For reading/writing file content
 // Constants for minimum and maximum update intervals (in milliseconds)
 const MIN_UPDATE_INTERVAL = 60 * 1000; // 1 minute
 const MAX_UPDATE_INTERVAL = 24 * 60 * 60 * 1000; // 24 hours
+const HTTP_TIMEOUT = 15 * 1000; // 15s timeout for API requests
 
 module.exports = NodeHelper.create({
     // Store the loaded city data
@@ -104,7 +105,10 @@ module.exports = NodeHelper.create({
 
         let openMeteoResponse;
         try {
-            const response = await fetch(openMeteoUrl);
+            const controller = new AbortController();
+            const timeout = setTimeout(() => controller.abort(), HTTP_TIMEOUT);
+            const response = await fetch(openMeteoUrl, { signal: controller.signal });
+            clearTimeout(timeout);
             if (!response.ok) {
                 const errorText = await response.text();
                 throw new Error(`Open-Meteo API error: ${response.statusText} - ${errorText}`);
