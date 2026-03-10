@@ -38,10 +38,15 @@ const fs = require("fs").promises; // For reading/writing file content
 const MIN_UPDATE_INTERVAL = 60 * 1000; // 1 minute
 const MAX_UPDATE_INTERVAL = 24 * 60 * 60 * 1000; // 24 hours
 const HTTP_TIMEOUT = 15 * 1000; // 15s timeout for API requests
+const RETRY_DELAY = 60 * 1000; // 60s retry on error (normal operation)
+const INITIAL_RETRY_DELAY = 2 * 1000; // 2s retry until first successful fetch
 
 module.exports = NodeHelper.create({
     // Store the loaded city data
     cities: [],
+
+    // Tracks whether at least one successful fetch has completed
+    hasData: false,
 
     // Debug level: default DEBUG until config arrives from frontend
     debugLevel: "DEBUG",
@@ -73,38 +78,40 @@ module.exports = NodeHelper.create({
 
     socketNotificationReceived: function(notification, payload) {
         this._log("DEBUG", `Received notification: ${notification}`);
-        if (notification === "FETCH_WEATHER") {
-            // Update debug level from config on first (and every subsequent) call
-            if (payload && payload.DebugLevel) {
-                if (this.debugLevel !== payload.DebugLevel) {
-                    this.debugLevel = payload.DebugLevel;
-                    this._log("DEBUG", `DebugLevel set to ${this.debugLevel}`);
-                }
+        if (notification === "START_WEATHER_POLL") {
+            if (this.config) {
+                this._log("DEBUG", "START_WEATHER_POLL ignored, already polling");
+                return;
             }
-            this.fetchWeatherData(payload);
+            this.config = payload;
+            if (payload && payload.DebugLevel) {
+                this.debugLevel = payload.DebugLevel;
+            }
+            this._log("INFO", "Config received, starting poll cycle");
+            this.pollWeather();
         }
     },
 
-    fetchWeatherData: async function(config) {
-        this._log("DEBUG", `fetchWeatherData called, ${this.cities.length} cities`);
+    pollWeather: async function() {
+        const config = this.config;
+        let nextPollDelay = this.hasData ? RETRY_DELAY : INITIAL_RETRY_DELAY;
 
-        if (this.cities.length === 0) {
-            this._log("ERROR", "No cities loaded, cannot fetch weather data");
-            this.sendSocketNotification("WEATHER_ERROR", "BestWeather: No cities loaded for weather fetch.");
-            return;
-        }
-
-        // 1. Prepare latitudes and longitudes for the Open-Meteo API
-        const latitudes = this.cities.map(city => city.lat).join(",");
-        const longitudes = this.cities.map(city => city.lon).join(",");
-
-        // 2. Construct the Open-Meteo API URL (with apparent_temperature for HCI scoring)
-        const openMeteoUrl = `https://api.open-meteo.com/v1/forecast?latitude=${latitudes}&longitude=${longitudes}&current=temperature_2m,apparent_temperature,weathercode,precipitation,cloud_cover,relative_humidity_2m,wind_speed_10m`;
-
-        this._log("DEBUG", `API URL: ${openMeteoUrl.substring(0, 120)}...`);
-
-        let openMeteoResponse;
         try {
+            this._log("DEBUG", `pollWeather called, ${this.cities.length} cities`);
+
+            if (this.cities.length === 0) {
+                throw new Error("No cities loaded, cannot fetch weather data");
+            }
+
+            // 1. Prepare latitudes and longitudes for the Open-Meteo API
+            const latitudes = this.cities.map(city => city.lat).join(",");
+            const longitudes = this.cities.map(city => city.lon).join(",");
+
+            // 2. Construct the Open-Meteo API URL (with apparent_temperature for HCI scoring)
+            const openMeteoUrl = `https://api.open-meteo.com/v1/forecast?latitude=${latitudes}&longitude=${longitudes}&current=temperature_2m,apparent_temperature,weathercode,precipitation,cloud_cover,relative_humidity_2m,wind_speed_10m`;
+
+            this._log("DEBUG", `API URL: ${openMeteoUrl.substring(0, 120)}...`);
+
             const controller = new AbortController();
             const timeout = setTimeout(() => controller.abort(), HTTP_TIMEOUT);
             const response = await fetch(openMeteoUrl, { signal: controller.signal });
@@ -113,19 +120,16 @@ module.exports = NodeHelper.create({
                 const errorText = await response.text();
                 throw new Error(`Open-Meteo API error: ${response.statusText} - ${errorText}`);
             }
-            openMeteoResponse = await response.json();
+            const openMeteoResponse = await response.json();
             this._log("DEBUG", `API response: ${Array.isArray(openMeteoResponse) ? openMeteoResponse.length : 'single'} entries received`);
-        } catch (error) {
-            this._log("ERROR", `API fetch error: ${error.message}`);
-            this.sendSocketNotification("WEATHER_ERROR", `BestWeather: Open-Meteo fetch error: ${error.message}`);
-            return;
-        }
 
-        // 3. HCI-adapted score calculation and determination of the TOP1 city
-        let bestScore = -Infinity;
-        let top1CityData = null;
+            // 3. HCI-adapted score calculation and determination of the TOP1 city
+            if (!Array.isArray(openMeteoResponse) || openMeteoResponse.length !== this.cities.length) {
+                throw new Error(`Invalid API response structure: isArray=${Array.isArray(openMeteoResponse)}, length=${Array.isArray(openMeteoResponse) ? openMeteoResponse.length : 'N/A'}, expected=${this.cities.length}`);
+            }
 
-        if (Array.isArray(openMeteoResponse) && openMeteoResponse.length === this.cities.length) {
+            let bestScore = -Infinity;
+            let top1CityData = null;
             const numCities = this.cities.length;
 
             // HCI configuration parameters with defaults
@@ -199,98 +203,101 @@ module.exports = NodeHelper.create({
                     };
                 }
             }
-        } else {
-            this._log("ERROR", `Invalid API response structure: isArray=${Array.isArray(openMeteoResponse)}, length=${Array.isArray(openMeteoResponse) ? openMeteoResponse.length : 'N/A'}, expected=${this.cities.length}`);
-            this.sendSocketNotification("WEATHER_ERROR", "BestWeather: Invalid API response structure.");
-            return;
-        }
 
-        // 4. Determine day or night for the TOP1 city
-        let isDayForTop1 = true;
-        if (top1CityData && top1CityData.latitude !== null && top1CityData.longitude !== null) {
-            const now = new Date();
-            const times = SunCalc.getTimes(now, top1CityData.latitude, top1CityData.longitude);
-            isDayForTop1 = now > times.sunrise && now < times.sunset;
-        } else {
-            this._log("WARN", "Could not determine day/night for TOP1 city, defaulting to day");
-        }
-
-        // 5. Calculate dynamic update interval
-        const openmeteoMaxQueriesPerDay = config.openmeteoMaxQueriesPerDay || 5000;
-        const numCitiesToQuery = this.cities.length;
-
-        let calculatedUpdateIntervalMs;
-        let resultingUpdatesPerDay = 0;
-        let resultingNumberOfQueriesPerDay = 0;
-
-        if (numCitiesToQuery > 0) {
-            let updatesPerDayCandidate = Math.floor(openmeteoMaxQueriesPerDay / numCitiesToQuery);
-            updatesPerDayCandidate = Math.floor(updatesPerDayCandidate / 10) * 10;
-            if (updatesPerDayCandidate === 0) {
-                updatesPerDayCandidate = 1;
+            if (!top1CityData) {
+                throw new Error("Could not determine TOP1 city from API response");
             }
-            resultingUpdatesPerDay = updatesPerDayCandidate;
 
-            const totalMinutesInDay = 24 * 60;
-            const intervalInMinutes = totalMinutesInDay / resultingUpdatesPerDay;
-            calculatedUpdateIntervalMs = intervalInMinutes * 60 * 1000;
+            // 4. Determine day or night for the TOP1 city
+            let isDayForTop1 = true;
+            if (top1CityData.latitude !== null && top1CityData.longitude !== null) {
+                const now = new Date();
+                const times = SunCalc.getTimes(now, top1CityData.latitude, top1CityData.longitude);
+                isDayForTop1 = now > times.sunrise && now < times.sunset;
+            } else {
+                this._log("WARN", "Could not determine day/night for TOP1 city, defaulting to day");
+            }
 
-            resultingNumberOfQueriesPerDay = resultingUpdatesPerDay * numCitiesToQuery;
-        } else {
-            this._log("WARN", "No cities configured, using MAX_UPDATE_INTERVAL");
-            calculatedUpdateIntervalMs = MAX_UPDATE_INTERVAL;
-        }
+            // 5. Calculate dynamic update interval
+            const openmeteoMaxQueriesPerDay = config.openmeteoMaxQueriesPerDay || 5000;
+            const numCitiesToQuery = this.cities.length;
 
-        calculatedUpdateIntervalMs = Math.max(MIN_UPDATE_INTERVAL, calculatedUpdateIntervalMs);
-        calculatedUpdateIntervalMs = Math.min(MAX_UPDATE_INTERVAL, calculatedUpdateIntervalMs);
+            let calculatedUpdateIntervalMs;
+            let resultingNumberOfQueriesPerDay = 0;
 
-        this._log("INFO", `Update interval: ${(calculatedUpdateIntervalMs / 1000).toFixed(0)}s (${resultingNumberOfQueriesPerDay} queries/day)`);
-
-        // 6. Write statistics to file if configured
-        if (config.statisticsFileName && top1CityData) {
-            const statsFilePath = this.path + "/" + config.statisticsFileName;
-            const now = new Date();
-            const timestamp = `${now.getDate().toString().padStart(2, '0')}.${(now.getMonth() + 1).toString().padStart(2, '0')}.${now.getFullYear()} ${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')}`;
-
-            // Extended CSV line with sub-scores
-            const csvLine = `${timestamp};${top1CityData.name};${top1CityData.weatherCode};${top1CityData.temperature};${top1CityData.apparentTemperature};${top1CityData.humidity};${top1CityData.cloudCover};${top1CityData.precipitation};${top1CityData.windSpeed};${top1CityData.tc.toFixed(2)};${top1CityData.aesthetic.toFixed(2)};${top1CityData.physical.toFixed(2)};${top1CityData.wcOverride.toFixed(2)};${top1CityData.score.toFixed(1)}\n`;
-
-            try {
-                const fileExists = await fs.access(statsFilePath, fs.constants.F_OK)
-                    .then(() => true)
-                    .catch(() => false);
-
-                if (!fileExists) {
-                    const header = "Timestamp;City;WeatherCode;Temperature;ApparentTemperature;Humidity;CloudCover;Precipitation;WindSpeed;TC;A;P;WC_Override;Score\n";
-                    await fs.writeFile(statsFilePath, header, { encoding: 'utf8' });
+            if (numCitiesToQuery > 0) {
+                let updatesPerDayCandidate = Math.floor(openmeteoMaxQueriesPerDay / numCitiesToQuery);
+                updatesPerDayCandidate = Math.floor(updatesPerDayCandidate / 10) * 10;
+                if (updatesPerDayCandidate === 0) {
+                    updatesPerDayCandidate = 1;
                 }
-                await fs.appendFile(statsFilePath, csvLine, { encoding: 'utf8' });
-                this._log("DEBUG", `Stats appended to ${config.statisticsFileName}`);
-            } catch (error) {
-                this._log("ERROR", `Error writing statistics to ${statsFilePath}: ${error.message}`);
-            }
-        }
 
-        // 7. Send the TOP1 city data and the calculated update interval to the main module
-        if (top1CityData) {
+                const totalMinutesInDay = 24 * 60;
+                const intervalInMinutes = totalMinutesInDay / updatesPerDayCandidate;
+                calculatedUpdateIntervalMs = intervalInMinutes * 60 * 1000;
+
+                resultingNumberOfQueriesPerDay = updatesPerDayCandidate * numCitiesToQuery;
+            } else {
+                this._log("WARN", "No cities configured, using MAX_UPDATE_INTERVAL");
+                calculatedUpdateIntervalMs = MAX_UPDATE_INTERVAL;
+            }
+
+            calculatedUpdateIntervalMs = Math.max(MIN_UPDATE_INTERVAL, calculatedUpdateIntervalMs);
+            calculatedUpdateIntervalMs = Math.min(MAX_UPDATE_INTERVAL, calculatedUpdateIntervalMs);
+
+            this._log("INFO", `Update interval: ${(calculatedUpdateIntervalMs / 1000).toFixed(0)}s (${resultingNumberOfQueriesPerDay} queries/day)`);
+
+            // 6. Write statistics to file if configured
+            if (config.statisticsFileName) {
+                const statsFilePath = this.path + "/" + config.statisticsFileName;
+                const now = new Date();
+                const timestamp = `${now.getDate().toString().padStart(2, '0')}.${(now.getMonth() + 1).toString().padStart(2, '0')}.${now.getFullYear()} ${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')}`;
+
+                // Extended CSV line with sub-scores
+                const csvLine = `${timestamp};${top1CityData.name};${top1CityData.weatherCode};${top1CityData.temperature};${top1CityData.apparentTemperature};${top1CityData.humidity};${top1CityData.cloudCover};${top1CityData.precipitation};${top1CityData.windSpeed};${top1CityData.tc.toFixed(2)};${top1CityData.aesthetic.toFixed(2)};${top1CityData.physical.toFixed(2)};${top1CityData.wcOverride.toFixed(2)};${top1CityData.score.toFixed(1)}\n`;
+
+                try {
+                    const fileExists = await fs.access(statsFilePath, fs.constants.F_OK)
+                        .then(() => true)
+                        .catch(() => false);
+
+                    if (!fileExists) {
+                        const header = "Timestamp;City;WeatherCode;Temperature;ApparentTemperature;Humidity;CloudCover;Precipitation;WindSpeed;TC;A;P;WC_Override;Score\n";
+                        await fs.writeFile(statsFilePath, header, { encoding: 'utf8' });
+                    }
+                    await fs.appendFile(statsFilePath, csvLine, { encoding: 'utf8' });
+                    this._log("DEBUG", `Stats appended to ${config.statisticsFileName}`);
+                } catch (statsError) {
+                    this._log("ERROR", `Error writing statistics to ${statsFilePath}: ${statsError.message}`);
+                    // Statistics error is non-fatal, continue with sending data
+                }
+            }
+
+            // 7. Send the TOP1 city data to the frontend
             this._log("INFO", `TOP1: ${top1CityData.name}, score=${top1CityData.score.toFixed(1)}, temp=${top1CityData.temperature}°C`);
-            const weatherData = {
+            this.sendSocketNotification("WEATHER_DATA", {
                 cityName: top1CityData.name,
                 temperature: top1CityData.temperature,
                 apparentTemperature: top1CityData.apparentTemperature,
                 weatherCode: top1CityData.weatherCode,
                 score: top1CityData.score,
                 isDay: isDayForTop1,
-                weatherIconClass: this.getWeatherIcon(top1CityData.weatherCode, isDayForTop1),
-                calculatedUpdateIntervalMs: calculatedUpdateIntervalMs
-            };
-            this._log("DEBUG", "Sending WEATHER_DATA to frontend");
-            this.sendSocketNotification("WEATHER_DATA", weatherData);
-        } else {
-            this._log("ERROR", "Could not determine TOP1 city, no data to send");
-            this.sendSocketNotification("WEATHER_ERROR", "BestWeather: Could not determine TOP1 city.");
-            this.sendSocketNotification("WEATHER_DATA", { calculatedUpdateIntervalMs: calculatedUpdateIntervalMs });
+                weatherIconClass: this.getWeatherIcon(top1CityData.weatherCode, isDayForTop1)
+            });
+
+            // Success: schedule next poll at calculated interval
+            this.hasData = true;
+            nextPollDelay = calculatedUpdateIntervalMs;
+
+        } catch (error) {
+            this._log("ERROR", `Poll failed: ${error.message}`);
+            // No WEATHER_ERROR to frontend — last good data stays displayed
+            // nextPollDelay remains RETRY_DELAY
         }
+
+        // ALWAYS schedule next poll — this is the core resilience guarantee
+        this._log("INFO", `Next poll in ${(nextPollDelay / 1000).toFixed(0)}s`);
+        this.pollTimer = setTimeout(() => this.pollWeather(), nextPollDelay);
     },
 
     getWeatherCodeOverride: function(weatherCode, overrides) {

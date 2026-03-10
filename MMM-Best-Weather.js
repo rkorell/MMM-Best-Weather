@@ -127,10 +127,8 @@ Module.register("MMM-Best-Weather", {
         this.weatherData = null; // Stores the fetched weather data
         this.loaded = false; // Flag if data has been loaded
         this.top1History = []; // Initializes the buffer for the TOP1 history
-        this.currentUpdateTimer = null; // Stores the timer for updates
-        this._log("INFO", "Module starting, requesting initial data");
-        this.getWeatherData(); // Starts the first data fetch
-        // scheduleUpdate will be called after first data fetch with calculated interval
+        this._log("INFO", "Module starting, sending config to backend");
+        this.sendSocketNotification("START_WEATHER_POLL", this.config);
     },
 
     // CSS files to be loaded
@@ -297,63 +295,25 @@ Module.register("MMM-Best-Weather", {
         return wrapper;
     },
 
-    // Schedules the next update
-    scheduleUpdate: function(delay) {
-        var self = this;
-        // Clear any existing timer to prevent multiple updates
-        if (this.currentUpdateTimer) {
-            clearTimeout(this.currentUpdateTimer);
-        }
-        // Schedule the next update
-        this.currentUpdateTimer = setTimeout(function() {
-            self.getWeatherData();
-        }, delay);
-        this._log("DEBUG", `Next update in ${(delay / 1000).toFixed(0)}s`);
-    },
-
-    // Requests weather data from the node_helper
-    getWeatherData: function() {
-        this._log("DEBUG", "Requesting FETCH_WEATHER from node_helper");
-        // Send the full config to the node_helper, including new impact parameters and API limit
-        this.sendSocketNotification("FETCH_WEATHER", this.config);
-    },
-
     // Receives notifications from the node_helper
     socketNotificationReceived: function(notification, payload) {
         if (notification === "WEATHER_DATA") {
             this._log("INFO", `Data received: ${payload.cityName || "no city"}, ${payload.temperature !== undefined ? payload.temperature + "°C" : "no temp"}`);
-            // Update weatherData
             this.weatherData = payload;
 
             // Add the current TOP1 city to the history
             if (this.weatherData && this.weatherData.cityName) {
-                // Only add if it's a new city or history is empty
                 if (this.top1History.length === 0 || this.top1History[0] !== this.weatherData.cityName) {
-                    this.top1History.unshift(this.weatherData.cityName); // Add to the beginning
+                    this.top1History.unshift(this.weatherData.cityName);
                     if (this.top1History.length > 2) {
-                        this.top1History.pop(); // Remove the oldest city if more than 2 are present
+                        this.top1History.pop();
                     }
                 }
             }
 
             this.loaded = true;
             this.updateDom(this.config.animationSpeed);
-
-            // Reschedule update with the interval calculated by the node_helper
-            if (payload.calculatedUpdateIntervalMs) {
-                this.scheduleUpdate(payload.calculatedUpdateIntervalMs);
-            } else {
-                this._log("WARN", "Node_helper did not provide an update interval. Scheduling with default (30 minutes).");
-                this.scheduleUpdate(30 * 60 * 1000); // Fallback to 30 minutes
-            }
-
-        } else if (notification === "WEATHER_ERROR") {
-            this._log("ERROR", `Error received: ${payload}`);
-            this.loaded = true;
-            this.weatherData = null; // Set data to null to display error message
-            this.updateDom(this.config.animationSpeed);
-            // On error, try again after a fixed interval (e.g., 5 minutes) to avoid hammering the API
-            this.scheduleUpdate(5 * 60 * 1000);
         }
+        // No WEATHER_ERROR handler — backend retries silently, last good data stays displayed
     }
 });
